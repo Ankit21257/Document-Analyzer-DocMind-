@@ -673,13 +673,13 @@ FALLBACK_MODELS = ["gemini-3.6-flash"]
 def get_embeddings():
     return GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
-        google_api_key=os.getenv("GOOGLE_API_KEY")
+        google_api_key=os.getenv("GOOGLE_API_KEY") or (st.secrets["GOOGLE_API_KEY"] if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets else "")
     )
 
 def get_llm(model_name: str = "gemini-3.6-flash"):
     return ChatGoogleGenerativeAI(
         model=model_name,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        google_api_key=os.getenv("GOOGLE_API_KEY") or (st.secrets["GOOGLE_API_KEY"] if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets else ""),
         temperature=0.0
     )
 
