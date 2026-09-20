@@ -11,12 +11,12 @@ A document analysis application built with Streamlit, LangChain, and Google Gemi
 
 1. **Clone the repository:**
    `ash
-   git clone https://github.com/YOUR_USERNAME/DocMind.git
+   git clone https://github.com/Ankit21257/Document-Analyzer-DocMind-.git
    cd DocMind
    `
 
 2. **Set up a virtual environment:**
-   `ash
+   `bash
    python -m venv venv
    # On Windows:
    venv\\Scripts\\activate
