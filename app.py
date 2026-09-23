@@ -8,7 +8,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from pypdf import PdfReader
+from typing import List
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_community.retrievers import BM25Retriever
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -713,16 +716,16 @@ def _extract_text(content) -> str:
     return str(content)
 
 
-def invoke_with_model_fallback(prompt_str_or_question: str, db=None, is_rag: bool = False):
+def invoke_with_model_fallback(prompt_str_or_question: str, db=None, is_rag: bool = False, retriever=None):
     """Tries primary model; if 429 (quota) or 503 (unavailable) occurs, automatically tries fallback models."""
     last_err = None
     for model_name in FALLBACK_MODELS:
         try:
             llm = get_llm(model_name)
             if is_rag:
-                rag_chain, retriever = build_rag_chain(db, llm)
+                rag_chain, active_retriever = build_rag_chain(db, llm, retriever=retriever)
                 answer = rag_chain.invoke(prompt_str_or_question)
-                return _extract_text(answer), retriever
+                return _extract_text(answer), active_retriever
             else:
                 response = llm.invoke(prompt_str_or_question)
                 content = response.content if hasattr(response, "content") else response
@@ -737,6 +740,49 @@ def invoke_with_model_fallback(prompt_str_or_question: str, db=None, is_rag: boo
                 raise e
     if last_err:
         raise last_err
+
+
+class HybridRetriever(BaseRetriever):
+    vector_retriever: object
+    bm25_retriever: object
+    weight_vector: float = 0.5
+    weight_bm25: float = 0.5
+    c: int = 60
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        vector_docs = self.vector_retriever.invoke(query)
+        bm25_docs = self.bm25_retriever.invoke(query)
+
+        doc_scores = {}
+        doc_map = {}
+
+        for rank, doc in enumerate(vector_docs):
+            doc_id = doc.page_content
+            doc_map[doc_id] = doc
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + self.weight_vector / (rank + 1 + self.c)
+
+        for rank, doc in enumerate(bm25_docs):
+            doc_id = doc.page_content
+            doc_map[doc_id] = doc
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + self.weight_bm25 / (rank + 1 + self.c)
+
+        sorted_doc_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+        return [doc_map[doc_id] for doc_id in sorted_doc_ids[:8]]
+
+
+def create_hybrid_retriever(db, valid_chunks):
+    vector_retriever = db.as_retriever(search_kwargs={"k": 8})
+    try:
+        bm25_retriever = BM25Retriever.from_documents(valid_chunks)
+        bm25_retriever.k = 8
+        return HybridRetriever(
+            vector_retriever=vector_retriever,
+            bm25_retriever=bm25_retriever,
+            weight_vector=0.5,
+            weight_bm25=0.5
+        )
+    except Exception:
+        return vector_retriever
 
 
 def load_pdf_documents(file_path: str):
@@ -808,7 +854,7 @@ def load_pdf_documents(file_path: str):
 
 
 def ingest_pdf_bytes(file_bytes: bytes):
-    """Ingest PDF bytes → in-memory ChromaDB with isolated collection. Returns (db, page_count, chunk_count)."""
+    """Ingest PDF bytes → in-memory ChromaDB + BM25 Hybrid Search. Returns (db, retriever, page_count, chunk_count)."""
     embeddings = get_embeddings()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -833,16 +879,18 @@ def ingest_pdf_bytes(file_bytes: bytes):
         # Create isolated collection with unique name to prevent cross-document contamination
         collection_name = f"doc_{uuid.uuid4().hex}"
         db = Chroma.from_documents(valid_chunks, embeddings, collection_name=collection_name)
+        retriever = create_hybrid_retriever(db, valid_chunks)
     finally:
         os.unlink(tmp_path)
 
-    return db, len(documents), len(valid_chunks)
+    return db, retriever, len(documents), len(valid_chunks)
 
 
 
-def build_rag_chain(db, llm):
-    """Build a fresh RAG chain from the given ChromaDB and LLM."""
-    retriever = db.as_retriever(search_kwargs={"k": 8})
+def build_rag_chain(db, llm, retriever=None):
+    """Build a fresh RAG chain using Hybrid Retriever (or ChromaDB retriever as fallback) and LLM."""
+    if retriever is None and db is not None:
+        retriever = db.as_retriever(search_kwargs={"k": 8})
     qa_prompt = PromptTemplate.from_template("""You are an intelligent document assistant. Answer the user's question using the provided context from the document.
 
 Guidelines:
@@ -953,7 +1001,7 @@ with st.sidebar:
 
 # Session state defaults
 defaults = {
-    "file_id": None, "db": None, "summary": None,
+    "file_id": None, "db": None, "retriever": None, "summary": None,
     "messages": [], "doc_name": None, "doc_pages": 0, "doc_chunks": 0,
 }
 for k, v in defaults.items():
@@ -980,22 +1028,24 @@ if uploaded_file is not None:
     if st.session_state.file_id != file_id:
         # New file → reset state
         st.session_state.update({
-            "messages": [], "summary": None, "db": None,
+            "messages": [], "summary": None, "db": None, "retriever": None,
             "file_id": file_id, "doc_name": uploaded_file.name,
         })
         with st.spinner(f"⚙️ Processing **{uploaded_file.name}**…"):
             try:
-                db, pages, chunks = ingest_pdf_bytes(uploaded_file.getvalue())
+                db, retriever, pages, chunks = ingest_pdf_bytes(uploaded_file.getvalue())
                 st.session_state.db = db
+                st.session_state.retriever = retriever
                 st.session_state.doc_pages = pages
                 st.session_state.doc_chunks = chunks
                 st.success(
-                    f"✅ **{uploaded_file.name}** ready — {pages} page(s), {chunks} chunks indexed.",
+                    f"✅ **{uploaded_file.name}** ready — {pages} page(s), {chunks} chunks indexed with Hybrid Search.",
                     icon="📄"
                 )
                 st.rerun()
             except Exception as e:
                 st.session_state.db = None
+                st.session_state.retriever = None
                 st.error(f"⚠️ {e}")
 
 
@@ -1017,6 +1067,7 @@ else:
         📄 {st.session_state.doc_name}
         &nbsp;·&nbsp; {st.session_state.doc_pages} pages
         &nbsp;·&nbsp; {st.session_state.doc_chunks} chunks
+        &nbsp;·&nbsp; ⚡ Hybrid Search (BM25 + Semantic)
     </div>
     """, unsafe_allow_html=True)
 
@@ -1065,8 +1116,13 @@ else:
 
         with st.spinner("Thinking…"):
             try:
-                answer, retriever = invoke_with_model_fallback(question, st.session_state.db, is_rag=True)
-                source_docs = retriever.invoke(question)
+                answer, active_retriever = invoke_with_model_fallback(
+                    question, 
+                    st.session_state.db, 
+                    is_rag=True, 
+                    retriever=st.session_state.get("retriever")
+                )
+                source_docs = active_retriever.invoke(question)
                 pages = sorted(set(doc.metadata.get("page", 0) + 1 for doc in source_docs))
                 source_text = f"Sources: page(s) {', '.join(str(p) for p in pages)}"
 
