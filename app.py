@@ -669,17 +669,32 @@ st.markdown('<hr class="gradient-divider" style="margin-top: 0.2rem;">', unsafe_
 # Helpers
 FALLBACK_MODELS = ["gemini-3.6-flash"]
 
+def get_api_key() -> str:
+    key = st.session_state.get("user_api_key") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key and hasattr(st, "secrets"):
+        try:
+            key = st.secrets.get("GOOGLE_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:
+            pass
+    return (key or "").strip()
+
 @st.cache_resource
-def get_embeddings():
+def get_embeddings(api_key: str = None):
+    key = api_key or get_api_key()
+    if not key:
+        raise ValueError("Google API key is missing. Please provide a valid GEMINI_API_KEY or GOOGLE_API_KEY in your .env file or sidebar.")
     return GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
-        google_api_key=os.getenv("GOOGLE_API_KEY") or (st.secrets["GOOGLE_API_KEY"] if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets else "")
+        google_api_key=key
     )
 
-def get_llm(model_name: str = "gemini-3.6-flash"):
+def get_llm(model_name: str = "gemini-3.6-flash", api_key: str = None):
+    key = api_key or get_api_key()
+    if not key:
+        raise ValueError("Google API key is missing. Please provide a valid GEMINI_API_KEY or GOOGLE_API_KEY in your .env file or sidebar.")
     return ChatGoogleGenerativeAI(
         model=model_name,
-        google_api_key=os.getenv("GOOGLE_API_KEY") or (st.secrets["GOOGLE_API_KEY"] if hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets else ""),
+        google_api_key=key,
         temperature=0.0
     )
 
@@ -927,6 +942,15 @@ def render_summary_html(text) -> str:
     </div>"""
 
 
+# Sidebar Configuration
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    st.markdown("Enter your **Google Gemini API Key** if not set in `.env`:")
+    input_key = st.text_input("Gemini API Key", value=st.session_state.get("user_api_key", ""), type="password", help="Get your API key from Google AI Studio: https://aistudio.google.com/")
+    if input_key:
+        st.session_state["user_api_key"] = input_key.strip()
+        st.success("API Key set successfully!", icon="🔑")
+
 # Session state defaults
 defaults = {
     "file_id": None, "db": None, "summary": None,
@@ -935,6 +959,10 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+current_key = get_api_key()
+if not current_key:
+    st.warning("⚠️ **Google API Key is missing!** Please set `GOOGLE_API_KEY` in your `.env` file or expand the sidebar (top-left arrow) to enter your API key.", icon="🔑")
 
 
 # Upload Section
